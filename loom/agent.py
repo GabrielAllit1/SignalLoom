@@ -29,6 +29,13 @@ BLOCKING_RISK_FLAGS = {
     "approval_exception_present",
 }
 
+HUMAN_GATED_ACTIONS = [
+    "approve_payment",
+    "mark_invoice_paid",
+    "send_webhook",
+    "modify_source_record",
+]
+
 
 @dataclass(slots=True)
 class AgentStep:
@@ -91,19 +98,28 @@ class InvoiceOpsAgent:
                 id="validate",
                 name="Validate invoice facts",
                 tool="invoice_validator",
-                objective="Check vendor, invoice ID, amount, due date, department, PO, payment terms, and review state.",
+                objective=(
+                    "Check vendor, invoice ID, amount, due date, department, PO, "
+                    "payment terms, and review state."
+                ),
             ),
             AgentStep(
                 id="exceptions",
                 name="Find exceptions and routing blockers",
                 tool="exception_detector",
-                objective="Identify missing fields, duplicates, threshold approvals, unresolved exceptions, and AP readiness blockers.",
+                objective=(
+                    "Identify missing fields, duplicates, threshold approvals, unresolved exceptions, "
+                    "and AP readiness blockers."
+                ),
             ),
             AgentStep(
                 id="produce",
                 name="Produce work product",
                 tool="deliverable_builder",
-                objective="Create AP packet, approval message, exception checklist, workflow payload, and agent run report.",
+                objective=(
+                    "Create AP packet, approval message, exception checklist, workflow payload, "
+                    "and agent run report."
+                ),
             ),
             AgentStep(
                 id="gate",
@@ -122,8 +138,8 @@ class InvoiceOpsAgent:
         run_id = f"agent-{result.source_id}-{safe_started}"
 
         steps = self.plan(result, goal)
-        structured = result.structured_data or {}
-        review = result.review or {}
+        structured = result.structured_data if isinstance(result.structured_data, dict) else {}
+        review = result.review if isinstance(result.review, dict) else {}
 
         for step in steps:
             step.status = "running"
@@ -139,18 +155,17 @@ class InvoiceOpsAgent:
                 step.output = self._gate(review)
             step.status = "complete"
 
-        route_allowed = bool(review.get("payment_ready"))
+        route_allowed = _review_route_allowed(review)
         needs_human_approval = True
 
-        action = str(
+        base_action = str(
             review.get("recommended_action")
             or "Review extracted facts, confirm exceptions, then route manually."
         )
-
         if route_allowed:
-            action = f"Human may approve routing after final review. {action}"
+            action = f"Human may approve routing after final review. {base_action}"
         else:
-            action = f"Hold for review before routing. {action}"
+            action = f"Hold for review before routing. {base_action}"
 
         cards = self._agent_cards(result, structured, review, steps, route_allowed, action)
 
@@ -216,17 +231,22 @@ class InvoiceOpsAgent:
             fields = {}
 
         present = sorted([key for key in REQUIRED_INVOICE_FIELDS if _present(fields.get(key))])
+        missing = _dedupe_strings(review.get("missing_fields") or [])
+
+        for key in REQUIRED_INVOICE_FIELDS:
+            if key not in present and key not in missing:
+                missing.append(key)
 
         return {
             "present_required_fields": present,
-            "missing_fields": review.get("missing_fields", []),
+            "missing_fields": missing,
             "record_count": review.get("record_count", 0),
             "payment_ready": bool(review.get("payment_ready")),
         }
 
     def _exceptions(self, review: dict[str, Any]) -> dict[str, Any]:
         return {
-            "risk_flags": review.get("risk_flags", []),
+            "risk_flags": _dedupe_strings(review.get("risk_flags") or []),
             "duplicates": review.get("duplicates", []),
             "recommended_route": review.get("recommended_route"),
             "recommended_action": review.get("recommended_action"),
@@ -242,13 +262,8 @@ class InvoiceOpsAgent:
     def _gate(self, review: dict[str, Any]) -> dict[str, Any]:
         return {
             "human_required": True,
-            "route_allowed_after_review": bool(review.get("payment_ready")),
-            "blocked_actions": [
-                "approve_payment",
-                "mark_invoice_paid",
-                "send_webhook_without_click",
-                "modify_source_record",
-            ],
+            "route_allowed_after_review": _review_route_allowed(review),
+            "blocked_actions": HUMAN_GATED_ACTIONS,
         }
 
     def _agent_cards(
@@ -273,7 +288,9 @@ class InvoiceOpsAgent:
             f"- {step.name}: {step.status} via `{step.tool}`" for step in steps
         )
 
-        blockers = list(review.get("missing_fields") or []) + list(review.get("risk_flags") or [])
+        blockers = _dedupe_strings(
+            list(review.get("missing_fields") or []) + list(review.get("risk_flags") or [])
+        )
         blocker_text = (
             "\n".join(f"- {item}" for item in blockers)
             if blockers
@@ -370,77 +387,91 @@ def run_agent(result: ExtractionResult, goal: str | None = None) -> AgentRun:
 
 
 def run_invoice_agent(
-    source_text: str,
-    structured_data: dict[str, Any] | None,
+    source_or_result: ExtractionResult | str,
+    structured_data: dict[str, Any] | str | None = None,
     history: list[Any] | None = None,
     services: dict[str, Any] | None = None,
     goal: str | None = None,
-) -> dict[str, Any]:
-    """Run the public bounded InvoiceOps agent contract.
+) -> AgentRun | dict[str, Any]:
+    """Run the public bounded InvoiceOps agent entry point.
 
-    This function is intentionally conservative and UI-safe. It inspects invoice
-    context, assesses AP readiness, plans the next workflow step, creates reusable
-    deliverables, verifies blockers, and stops at a human approval gate.
+    This function intentionally supports both calling styles used in this repo:
 
-    It never:
-    - approves payment
-    - marks an invoice paid
-    - sends a webhook automatically
-    - modifies source evidence
+    1. Runtime/UI style:
+       run_invoice_agent(result: ExtractionResult, goal: str | None = None) -> AgentRun
+
+    2. Public contract/test style:
+       run_invoice_agent(source_text: str, structured_data: dict, history=None, services=None) -> dict
+
+    In both modes it never approves payment, marks an invoice paid, sends a webhook
+    automatically, or modifies source evidence.
     """
+    if isinstance(source_or_result, ExtractionResult):
+        runtime_goal = goal
+        if isinstance(structured_data, str) and runtime_goal is None:
+            runtime_goal = structured_data
+        return InvoiceOpsAgent(runtime_goal or DEFAULT_AGENT_GOAL).apply(
+            source_or_result,
+            runtime_goal,
+        )
+
+    source_text = source_or_result or ""
+    if structured_data is not None and not isinstance(structured_data, dict):
+        raise TypeError("structured_data must be a dictionary when source_text is provided")
+
     selected_goal = goal or DEFAULT_AGENT_GOAL
     history = history or []
     services = services or {}
-    structured_data = structured_data or {}
+    structured = structured_data or {}
 
-    review = _extract_review(structured_data)
-    fields = _extract_fields(structured_data, review)
+    review = _extract_review(structured)
+    fields = _extract_fields(structured, review)
 
     invoice_id = _first_present(
         fields.get("invoice_id"),
         fields.get("invoice_number"),
         fields.get("invoice"),
-        structured_data.get("invoice_id"),
-        structured_data.get("invoice_number"),
+        structured.get("invoice_id"),
+        structured.get("invoice_number"),
     )
     vendor = _first_present(
         fields.get("vendor"),
         fields.get("supplier"),
-        structured_data.get("vendor"),
-        structured_data.get("supplier"),
+        structured.get("vendor"),
+        structured.get("supplier"),
     )
     total = _first_present(
         fields.get("total_amount"),
         fields.get("amount"),
         fields.get("total"),
         fields.get("total_amount_sum"),
-        structured_data.get("total_amount"),
-        structured_data.get("amount"),
+        structured.get("total_amount"),
+        structured.get("amount"),
     )
-    due_date = _first_present(fields.get("due_date"), structured_data.get("due_date"))
+    due_date = _first_present(fields.get("due_date"), structured.get("due_date"))
     invoice_date = _first_present(
         fields.get("invoice_date"),
         fields.get("date"),
-        structured_data.get("invoice_date"),
-        structured_data.get("date"),
+        structured.get("invoice_date"),
+        structured.get("date"),
     )
     department = _first_present(
         fields.get("department"),
         fields.get("cost_center"),
-        structured_data.get("department"),
-        structured_data.get("cost_center"),
+        structured.get("department"),
+        structured.get("cost_center"),
     )
     payment_terms = _first_present(
         fields.get("payment_terms"),
         fields.get("terms"),
-        structured_data.get("payment_terms"),
-        structured_data.get("terms"),
+        structured.get("payment_terms"),
+        structured.get("terms"),
     )
     po_number = _first_present(
         fields.get("po_number"),
         fields.get("purchase_order"),
-        structured_data.get("po_number"),
-        structured_data.get("purchase_order"),
+        structured.get("po_number"),
+        structured.get("purchase_order"),
     )
 
     normalized_fields = {
@@ -472,7 +503,7 @@ def run_invoice_agent(
     if duplicate:
         risk_flags = _append_once(risk_flags, "duplicate_invoice_number")
 
-    approval_exception = _contains_approval_exception(review, structured_data, source_text)
+    approval_exception = _contains_approval_exception(review, structured, source_text)
     if approval_exception:
         risk_flags = _append_once(risk_flags, "approval_exception_present")
 
@@ -496,17 +527,21 @@ def run_invoice_agent(
         recommended_action = "Human reviewer may route the AP packet after final review."
 
     available_services = sorted(
-        key for key, value in services.items() if _present(value) and not str(key).lower().endswith("key")
+        key
+        for key, value in services.items()
+        if _present(value) and not str(key).lower().endswith("key")
     )
     sensitive_services_configured = sorted(
-        key for key, value in services.items() if _present(value) and str(key).lower().endswith("key")
+        key
+        for key, value in services.items()
+        if _present(value) and str(key).lower().endswith("key")
     )
 
     inspect = {
         "source_present": bool(source_text),
         "source_chars": len(source_text or ""),
         "source_preview": _clean_preview(source_text, limit=500),
-        "structured_keys": sorted(structured_data.keys()),
+        "structured_keys": sorted(structured.keys()),
         "services_available": available_services,
         "sensitive_services_configured": sensitive_services_configured,
         "invoice_id": invoice_id,
@@ -554,7 +589,7 @@ def run_invoice_agent(
         recommended_step=recommended_step,
         recommended_action=recommended_action,
         source_text=source_text,
-        structured_data=structured_data,
+        structured_data=structured,
     )
 
     actions = {
@@ -579,13 +614,11 @@ def run_invoice_agent(
         "required": True,
         "external_routing_required": True,
         "payment_approval_required": True,
-        "blocked_without_user_click": [
-            "approve_payment",
-            "mark_invoice_paid",
-            "send_webhook",
-            "modify_source_record",
-        ],
-        "note": "The agent can prepare and recommend. A human must approve external routing and payment actions.",
+        "blocked_without_user_click": HUMAN_GATED_ACTIONS,
+        "note": (
+            "The agent can prepare and recommend. A human must approve external routing "
+            "and payment actions."
+        ),
     }
 
     return {
@@ -653,6 +686,7 @@ def _build_agent_deliverables(
 
     risk_text = ", ".join(risk_flags) if risk_flags else "None detected"
     missing_text = ", ".join(missing_fields) if missing_fields else "None detected"
+    structured_key_text = ", ".join(sorted(structured_data.keys())) if structured_data else "None"
 
     agent_report = f"""# Agent Run Report
 
@@ -669,7 +703,7 @@ Goal: {goal}
 ## Inspect
 - Source present: {bool(source_text)}
 - Source characters: {len(source_text or "")}
-- Structured keys: {", ".join(sorted(structured_data.keys())) if structured_data else "None"}
+- Structured keys: {structured_key_text}
 
 ## Assess
 - Vendor: {vendor}
@@ -761,13 +795,51 @@ Governance:
     }
 
     return [
-        {"id": "agent_report", "title": "Agent Run Report", "kind": "markdown", "body": agent_report},
-        {"id": "ap_packet", "title": "AP Review Packet", "kind": "markdown", "body": ap_packet},
-        {"id": "approval_route", "title": "Approval Route Recommendation", "kind": "markdown", "body": approval_route},
-        {"id": "slack_approval", "title": "Slack Approval Message", "kind": "text", "body": slack_message},
-        {"id": "exception_checklist", "title": "Exception Checklist", "kind": "markdown", "body": exception_checklist},
-        {"id": "workflow_payload", "title": "n8n / Make / Zapier Payload", "kind": "json", "body": workflow_payload},
+        {
+            "id": "agent_report",
+            "title": "Agent Run Report",
+            "kind": "markdown",
+            "body": agent_report,
+        },
+        {
+            "id": "ap_packet",
+            "title": "AP Review Packet",
+            "kind": "markdown",
+            "body": ap_packet,
+        },
+        {
+            "id": "approval_route",
+            "title": "Approval Route Recommendation",
+            "kind": "markdown",
+            "body": approval_route,
+        },
+        {
+            "id": "slack_approval",
+            "title": "Slack Approval Message",
+            "kind": "text",
+            "body": slack_message,
+        },
+        {
+            "id": "exception_checklist",
+            "title": "Exception Checklist",
+            "kind": "markdown",
+            "body": exception_checklist,
+        },
+        {
+            "id": "workflow_payload",
+            "title": "n8n / Make / Zapier Payload",
+            "kind": "json",
+            "body": workflow_payload,
+        },
     ]
+
+
+def _review_route_allowed(review: dict[str, Any]) -> bool:
+    risk_flags = _dedupe_strings(review.get("risk_flags") or [])
+    blocking = any(flag in BLOCKING_RISK_FLAGS for flag in risk_flags)
+    missing = bool(review.get("missing_fields") or [])
+    duplicate = bool(review.get("duplicates") or [])
+    return bool(review.get("payment_ready")) and not blocking and not missing and not duplicate
 
 
 def _has_duplicate_invoice(invoice_id: Any, history: list[Any]) -> bool:
@@ -899,4 +971,6 @@ __all__ = [
     "run_agent",
     "run_invoice_agent",
     "DEFAULT_AGENT_GOAL",
+    "REQUIRED_INVOICE_FIELDS",
+    "BLOCKING_RISK_FLAGS",
 ]
