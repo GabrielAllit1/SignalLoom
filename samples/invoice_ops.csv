@@ -1,4 +1,0 @@
-Invoice ID,Vendor,Invoice Date,Due Date,Department,Campaign,PO Number,Cost Center,GL Code,Payment Terms,Approver,Total Amount,Approval Status,Notes
-INV-2026-001,Northstar Media Group,2026-02-01,2026-02-15,Marketing,Launch Awareness,PO-8842,MKT-220,6100,Net 15,A. Rivera,$48295.52,Pending,High dollar media buy
-INV-2026-002,Tampa Creative Lab,2026-02-03,2026-02-20,Marketing,Creative Refresh,PO-8848,MKT-225,6200,Net 30,J. Miles,$4263.19,Approved,Ready for AP
-INV-2026-003,BlueOrbit Analytics,2026-02-06,2026-02-21,Marketing,Attribution Audit,PO-8851,MKT-230,6300,Net 15,K. Shah,$12950.00,Pending,Requires manager approval
